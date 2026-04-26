@@ -1,0 +1,23 @@
+# .NET Core
+bin/
+obj/
+*.user
+*.userosscache
+*.sln.docstates
+
+# IDE / VS
+.vs/
+.idea/
+*.suo
+*.vscode/
+
+# Secrets and Configs
+# КРИТИЧНО: Никогда не коммитить API ключи!
+*.env
+appsettings.Development.json
+appsettings.Local.json
+secrets.json
+
+# OS generated files
+.DS_Store
+Thumbs.db
