@@ -1,73 +1,89 @@
-﻿using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.AI;
-using Google.GenAI;
-using System.Text;
+using AiCodeReviewer.Options;
+using AiCodeReviewer.Services;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 
-// 1. Setup Configuration
-var config = new ConfigurationBuilder()
-    .AddUserSecrets<Program>()
-    .Build();
+// 1. Setup Host Builder
+var builder = Host.CreateApplicationBuilder(args);
 
-string apiKey = config["AI:GeminiKey"] ?? throw new Exception("API Key not found!");
+// Ensure user secrets are loaded even if environment is not explicitly Development
+builder.Configuration.AddUserSecrets<Program>(optional: true);
 
-// 2. Initialize Client
-var googleClient = new Client(apiKey: apiKey);
-// Using Gemini 3 Flash - the fastest 2026 model for dev tools
-IChatClient client = googleClient.AsIChatClient("gemini-3-flash-preview");
+// 2. Configure Options
+builder.Services.AddOptions<AiOptions>()
+    .BindConfiguration(AiOptions.SectionName)
+    .ValidateDataAnnotations()
+    .ValidateOnStart();
 
-// 3. Robust Directory Discovery
-static string FindSrcPath(string startDir)
+builder.Services.AddOptions<SourceCodeProviderOptions>()
+    .BindConfiguration(SourceCodeProviderOptions.SectionName)
+    .ValidateDataAnnotations()
+    .ValidateOnStart();
+
+// 3. Configure Services
+builder.Services.AddTransient<ISourceCodeProvider, SourceCodeProvider>();
+builder.Services.AddTransient<IAiReviewService, AiReviewService>();
+
+// 4. Build Host
+using var host = builder.Build();
+
+var logger = host.Services.GetRequiredService<ILogger<Program>>();
+logger.LogInformation("Starting AI Code Reviewer...");
+
+try
 {
-    var dir = new DirectoryInfo(startDir);
-    while (dir != null && !dir.GetDirectories("src").Any())
-        dir = dir.Parent;
+    var sourceCodeProvider = host.Services.GetRequiredService<ISourceCodeProvider>();
+    var aiReviewService = host.Services.GetRequiredService<IAiReviewService>();
 
-    return dir != null ? Path.Combine(dir.FullName, "src") : throw new DirectoryNotFoundException("Could not locate 'src' folder!");
+    // Determine the root path to review
+    var startPath = FindSrcDirectory(Directory.GetCurrentDirectory());
+    logger.LogInformation("Discovering source files starting from: {StartPath}", startPath);
+
+    var codeFiles = await sourceCodeProvider.GetSourceFilesAsync(startPath);
+    var codeFilesList = codeFiles.ToList();
+
+    if (!codeFilesList.Any())
+    {
+        logger.LogWarning("No source files found to review.");
+        return;
+    }
+
+    logger.LogInformation("Found {Count} files to review.", codeFilesList.Count);
+
+    // Perform AI Review
+    var reviewResult = await aiReviewService.ReviewCodeAsync(codeFilesList);
+
+    // Output Results
+    Console.WriteLine("\n================ AI CODE REVIEW =================\n");
+    Console.WriteLine(reviewResult.Feedback);
+    Console.WriteLine("\n=================================================");
+}
+catch (Exception exception)
+{
+    logger.LogCritical(exception, "An unexpected error occurred during execution.");
+}
+finally
+{
+    logger.LogInformation("AI Code Reviewer finished.");
 }
 
-string srcPath = FindSrcPath(AppContext.BaseDirectory);
-var codeFiles = Directory.GetFiles(srcPath, "*.cs", SearchOption.AllDirectories)
-    .Where(f => !f.Contains("obj") && !f.Contains("bin"))
-    .ToList();
-
-// Debug output to see what is happening
-Console.WriteLine($"[DEBUG] Scanning: {srcPath}");
-Console.WriteLine($"[DEBUG] Found {codeFiles.Count} files.");
-
-if (codeFiles.Count == 0)
+// Helper to find 'src' directory from current execution path
+static string FindSrcDirectory(string currentPath)
 {
-    Console.WriteLine("Error: No .cs files found. Check your directory structure.");
-    return;
+    var dirInfo = new DirectoryInfo(currentPath);
+
+    while (dirInfo != null)
+    {
+        var potentialSrc = Path.Combine(dirInfo.FullName, "src");
+        if (Directory.Exists(potentialSrc))
+        {
+            return potentialSrc;
+        }
+        dirInfo = dirInfo.Parent;
+    }
+
+    // Default to current directory if no 'src' found
+    return currentPath;
 }
-
-// 4. Prepare Context & Prompt (English-optimized)
-var contextBuilder = new StringBuilder();
-contextBuilder.AppendLine("Task: Perform a Code Review of the following C# project.");
-contextBuilder.AppendLine("Focus: SOLID principles, Clean Code violations, and potential bugs.");
-contextBuilder.AppendLine("Format: Technical, concise, and structured feedback in English.\n");
-
-foreach (var file in codeFiles)
-{
-    string relativePath = Path.GetRelativePath(srcPath, file);
-    string content = await File.ReadAllTextAsync(file);
-
-    contextBuilder.AppendLine($"--- FILE: {relativePath} ---");
-    contextBuilder.AppendLine(content);
-    contextBuilder.AppendLine("--- END OF FILE ---\n");
-}
-
-contextBuilder.AppendLine("\nPlease provide your feedback based on the code provided above.");
-
-// 5. Execution
-var chatHistory = new List<ChatMessage>
-{
-    new ChatMessage(ChatRole.User, contextBuilder.ToString())
-};
-
-var options = new ChatOptions { Temperature = 0.0f };
-Console.WriteLine($"Sending context to {client.GetType().Name}... Please wait.");
-
-var response = await client.GetResponseAsync(chatHistory, options);
-
-Console.WriteLine("\n=== AI ARCHITECT REVIEW ===\n");
-Console.WriteLine(response.Messages[0].Text);
